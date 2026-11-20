@@ -23,6 +23,7 @@ from .catalog import (
     STATUS_COMPLETE,
     STATUS_FAILED,
     STATUS_PENDING,
+    StaleDayError,
     Store,
     parse_day,
     source_from_env,
@@ -99,22 +100,57 @@ def create_app(
     @app.get("/runs/<int:run_id>")
     def run_detail(run_id: int):
         st: Store = current_store()
-        run = st.get_run(run_id)
-        if run is None:
+        snapshot = st.run_snapshot(run_id)
+        if snapshot is None:
             abort(404)
-        days = st.days(run_id)
         counts = {status: 0 for status in STATUS_LABELS}
-        for row in days:
+        for row in snapshot.days:
             counts[row["status"]] = counts.get(row["status"], 0) + 1
         return render_template(
             "run.html",
-            run=run,
-            days=days,
+            run=snapshot.run,
+            days=snapshot.days,
             counts=counts,
             labels=STATUS_LABELS,
-            ready=st.is_ready(run_id),
-            events=st.events(run_id),
+            ready=snapshot.ready,
+            events=snapshot.events,
+            max_span=MAX_SPAN_DAYS,
         )
+
+    @app.post("/runs/<int:run_id>/reschedule")
+    def reschedule_run(run_id: int):
+        st: Store = current_store()
+        if st.get_run(run_id) is None:
+            abort(404)
+        try:
+            start = parse_day(request.form.get("start_date", ""))
+            end = parse_day(request.form.get("end_date", ""))
+        except ValueError as exc:
+            flash(str(exc), "error")
+            return redirect(url_for("run_detail", run_id=run_id))
+        try:
+            # A single transaction; on failure the saved range, progress and
+            # events are untouched.  Rescheduling never takes the work lock, so
+            # an in-flight collection or backfill does not block the save.
+            result = st.reschedule_run(run_id, start, end)
+        except KeyError:
+            abort(404)
+        except ValueError as exc:
+            flash(f"改期未保存，原任务保持不变：{exc}", "error")
+            return redirect(url_for("run_detail", run_id=run_id))
+        if not result.changed:
+            flash("新范围与当前范围一致，任务未改动", "info")
+        else:
+            parts = []
+            if result.removed:
+                parts.append(f"移出 {len(result.removed)} 天（进度与事件已删除，编号已释放）")
+            if result.added:
+                parts.append(f"纳入 {len(result.added)} 天（从待查询开始）")
+            retained = len(result.retained)
+            if retained:
+                parts.append(f"保留 {retained} 天的进度与事件")
+            flash("改期已保存：" + "；".join(parts), "info")
+        return redirect(url_for("run_detail", run_id=run_id))
 
     @app.post("/runs/<int:run_id>/collect")
     def run_collect(run_id: int):
@@ -126,11 +162,13 @@ def create_app(
             return redirect(url_for("run_detail", run_id=run_id))
         try:
             summary = collect(st, current_source(), run_id)
-            flash(
+            message = (
                 f"本次采集：查全 {summary.completed} 天，待补档 {summary.blocked} 天，"
-                f"待重试 {summary.failed} 天",
-                "info" if not summary.failed else "warn",
+                f"待重试 {summary.failed} 天"
             )
+            if summary.stale:
+                message += f"；{summary.stale} 个请求因改期已失效，未写入"
+            flash(message, "info" if not summary.failed else "warn")
         finally:
             work_lock.release()
         return redirect(url_for("run_detail", run_id=run_id))
@@ -144,6 +182,21 @@ def create_app(
         rows = [r for r in st.days(run_id) if r["day"] == day]
         if not rows:
             abort(404)
+        current_epoch = int(rows[0]["epoch"])
+        try:
+            form_epoch = int(request.form.get("epoch", ""))
+        except (TypeError, ValueError):
+            form_epoch = None
+        if form_epoch != current_epoch:
+            # The form was opened before a reschedule that removed this day
+            # (whether or not it was later re-added): it is invalid even though
+            # the day may exist again.
+            flash(
+                f"{day} 的补档表单已因改期失效，请刷新页面后重新选择文件，"
+                "进度保持不变",
+                "error",
+            )
+            return redirect(url_for("run_detail", run_id=run_id))
         if rows[0]["status"] != STATUS_BLOCKED:
             flash(f"{day} 不是待补档日期，无需上传", "warn")
             return redirect(url_for("run_detail", run_id=run_id))
@@ -160,7 +213,14 @@ def create_app(
                 day,
                 parsed.events,
                 verify=lambda existing: verify_includes_collected(parsed, existing),
+                epoch=current_epoch,
             )
+        except StaleDayError:
+            flash(
+                f"{day} 在上传期间被改期移出又纳入，旧表单已失效，进度保持不变",
+                "error",
+            )
+            return redirect(url_for("run_detail", run_id=run_id))
         except CsvValidationError as exc:
             flash("补档文件校验失败，进度保持不变：" + "；".join(exc.errors), "error")
             return redirect(url_for("run_detail", run_id=run_id))
@@ -174,17 +234,18 @@ def create_app(
     @app.get("/runs/<int:run_id>/download")
     def download_run(run_id: int):
         st: Store = current_store()
-        run = st.get_run(run_id)
-        if run is None:
+        snapshot = st.run_snapshot(run_id)
+        if snapshot is None:
             abort(404)
-        if not st.is_ready(run_id):
+        if not snapshot.ready:
             flash("还有未查全或未补档的日期，暂不能下载完整目录", "error")
             return redirect(url_for("run_detail", run_id=run_id))
-        events = st.events(run_id)
+        # Both contents and filename come from this one saved state.
+        run = snapshot.run
         buffer = io.StringIO()
         writer = csv.writer(buffer, lineterminator="\n")
         writer.writerow(["event_id", "utc_time", "magnitude"])
-        for row in events:
+        for row in snapshot.events:
             writer.writerow([row["event_id"], row["utc_time"], f"{row['magnitude']:g}"])
         filename = f"catalog_{run['start_date']}_{run['end_date']}.csv"
         return Response(

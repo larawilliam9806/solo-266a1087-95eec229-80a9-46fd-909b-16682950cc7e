@@ -10,6 +10,12 @@ operator uploads the complete CSV for that day.
 
 Retries only touch days that are ``pending`` or ``failed``; days already
 ``complete`` or ``blocked`` are never re-requested.
+
+Rescheduling a run while a collection is in flight does not wait for it.
+Each request snapshots the membership epoch of the days it targets; when the
+response comes back the write is accepted only for days that have stayed in
+the run with the same epoch.  A day removed by the reschedule (even if later
+re-added) makes the stale request skip it silently.
 """
 
 from __future__ import annotations
@@ -24,6 +30,7 @@ from .catalog import (
     CatalogSource,
     Event,
     SourceError,
+    StaleDayError,
     Store,
 )
 
@@ -33,6 +40,7 @@ class CollectSummary:
     completed: int = 0
     blocked: int = 0
     failed: int = 0
+    stale: int = 0
 
 
 def contiguous_segments(days: list[dt.date]) -> list[list[dt.date]]:
@@ -50,6 +58,10 @@ def collect(store: Store, source: CatalogSource, run_id: int) -> CollectSummary:
     rows = store.days(run_id)
     if not rows:
         raise KeyError(run_id)
+    # Snapshot the membership epochs up front.  Reschedules that land while the
+    # requests below are in flight change these epochs, and the guarded writes
+    # then refuse to touch the affected days.
+    epochs = {row["day"]: row["epoch"] for row in rows}
     targets = [
         dt.date.fromisoformat(row["day"])
         for row in rows
@@ -58,13 +70,41 @@ def collect(store: Store, source: CatalogSource, run_id: int) -> CollectSummary:
     summary = CollectSummary()
     for segment in contiguous_segments(targets):
         for start in range(0, len(segment), MAX_SPAN_DAYS):
-            _walk(store, source, run_id, segment[start : start + MAX_SPAN_DAYS], summary)
+            _walk(
+                store,
+                source,
+                run_id,
+                segment[start : start + MAX_SPAN_DAYS],
+                epochs,
+                summary,
+            )
     return summary
 
 
-def _mark_failed(store: Store, run_id: int, days: list[dt.date], message: str) -> None:
+def _mark_failed(
+    store: Store,
+    run_id: int,
+    days: list[dt.date],
+    epochs: dict[str, int],
+    message: str,
+    summary: CollectSummary,
+) -> None:
     for day in days:
-        store.mark(run_id, day.isoformat(), STATUS_FAILED, last_error=message)
+        day_text = day.isoformat()
+        try:
+            store.mark(
+                run_id,
+                day_text,
+                STATUS_FAILED,
+                last_error=message,
+                epoch=epochs.get(day_text),
+            )
+        except (KeyError, StaleDayError):
+            # The day left the run (or re-joined with a new epoch) while the
+            # request was in flight: its failure must not be recorded.
+            summary.stale += 1
+        else:
+            summary.failed += 1
 
 
 def _walk(
@@ -72,6 +112,7 @@ def _walk(
     source: CatalogSource,
     run_id: int,
     days: list[dt.date],
+    epochs: dict[str, int],
     summary: CollectSummary,
 ) -> None:
     if not days:
@@ -80,14 +121,12 @@ def _walk(
     try:
         events = source.fetch_page(start, end)
     except SourceError as exc:
-        _mark_failed(store, run_id, days, f"请求失败: {exc}")
-        summary.failed += len(days)
+        _mark_failed(store, run_id, days, epochs, f"请求失败: {exc}", summary)
         return
 
     page_size = source.page_size()
     if len(events) > page_size:
-        _mark_failed(store, run_id, days, "接口返回条数超过单页上限")
-        summary.failed += len(days)
+        _mark_failed(store, run_id, days, epochs, "接口返回条数超过单页上限", summary)
         return
 
     # The source promises events inside the requested window; treat a breach as
@@ -98,23 +137,28 @@ def _walk(
         except ValueError:
             event_day = None
         if event_day is None or not (start <= event_day <= end):
-            _mark_failed(store, run_id, days, "接口返回了区间外的事件")
-            summary.failed += len(days)
+            _mark_failed(store, run_id, days, epochs, "接口返回了区间外的事件", summary)
             return
 
     if len(events) >= page_size:
         if len(days) == 1:
             try:
-                store.record_blocked_day(run_id, days[0].isoformat(), events)
-            except ValueError as exc:
-                _mark_failed(store, run_id, days, str(exc))
-                summary.failed += 1
+                store.record_blocked_day(
+                    run_id,
+                    days[0].isoformat(),
+                    events,
+                    epoch=epochs.get(days[0].isoformat()),
+                )
+            except StaleDayError:
+                summary.stale += 1
+            except (KeyError, ValueError) as exc:
+                _mark_failed(store, run_id, days, epochs, str(exc), summary)
             else:
                 summary.blocked += 1
         else:
             middle = len(days) // 2
-            _walk(store, source, run_id, days[:middle], summary)
-            _walk(store, source, run_id, days[middle:], summary)
+            _walk(store, source, run_id, days[:middle], epochs, summary)
+            _walk(store, source, run_id, days[middle:], epochs, summary)
         return
 
     # Fewer than a full page: the whole range is exhausted.
@@ -122,9 +166,9 @@ def _walk(
     for event in events:
         by_day[event.utc_time[:10]].append(event)
     try:
-        store.complete_days(run_id, by_day)
+        written = store.complete_days(run_id, by_day, epochs=epochs)
     except ValueError as exc:
-        _mark_failed(store, run_id, days, str(exc))
-        summary.failed += len(days)
+        _mark_failed(store, run_id, days, epochs, str(exc), summary)
     else:
-        summary.completed += len(days)
+        summary.completed += len(written)
+        summary.stale += len(by_day) - len(written)

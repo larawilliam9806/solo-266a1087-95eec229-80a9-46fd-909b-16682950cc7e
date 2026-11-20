@@ -33,6 +33,22 @@
   {% else %}
   <p class="banner">逐日进度如下。请求失败的日期会在“采集 / 重试”时重试；已查全与待补档的日期不会重复请求。</p>
   {% endif %}
+
+  <h2>改期（调整起止 UTC 日期）</h2>
+  <p class="muted">
+    仍限 {{ max_span }} 个连续日。留在范围内的日期保留进度与事件；移出的日期连同进度、事件一并删除并释放事件编号；
+    新增或重新纳入的日期从“待查询”开始。改期无需等待正在进行的采集或补档；改期前发出的请求和已打开的补档表单，
+    仅对其间一直留在任务内的日期有效。
+  </p>
+  <form method="post" action="{{ url_for('reschedule_run', run_id=run['id']) }}" class="row">
+    <label>开始 UTC 日
+      <input type="date" name="start_date" value="{{ run['start_date'] }}" required>
+    </label>
+    <label>结束 UTC 日
+      <input type="date" name="end_date" value="{{ run['end_date'] }}" required>
+    </label>
+    <button type="submit" class="secondary">保存改期</button>
+  </form>
 </section>
 
 <section class="card">
@@ -55,6 +71,7 @@
             <form method="post" enctype="multipart/form-data"
                   action="{{ url_for('upload_day', run_id=run['id'], day=day['day']) }}"
                   class="upload">
+              <input type="hidden" name="epoch" value="{{ day['epoch'] }}">
               <input type="file" name="csv" accept=".csv,text/csv" required>
               <button type="submit">上传全日 CSV</button>
             </form>

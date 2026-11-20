@@ -60,6 +60,7 @@ button, .button {
   text-decoration: none;
 }
 button:hover, .button:hover { filter: brightness(1.08); }
+button.secondary { background: #475467; }
 .button.disabled {
   background: #c3cad3;
   cursor: not-allowed;
